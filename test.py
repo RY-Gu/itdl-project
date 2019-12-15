@@ -1,49 +1,50 @@
+import pandas as pd
+from train import create_sentence, evaluate
+from argument import Argument
 import torch
-from dataset import PaperDataset
-from models.model import Model
-from args import parse_args, set_args
+from torch.nn import functional as F
 from tqdm import tqdm
 
-from train import evaluate
-
-
-def test(args, dataset, model):
+def test(model, dataset, path = None, beam = False, beam_size = 4, k = 6, test_mode = True) :
+    if path != None : model.load_state_dict(torch.load(path))
+    args = Argument()
     model.eval()
-    test_iter = dataset.make_test(args)
-    result = open("./outputs/" + args.save.split("/")[-1] + ".inputs.beam_predictions.cmdline", 'w')
+    loader = dataset.test_iter
     preds = []
-    golds = []
-    for idx, batch in tqdm(enumerate(test_iter)):
-        batch = dataset.collate_fn(batch)
+    targets = []
+    loss = 0
+    example_num = 0
+    with torch.no_grad() :
+        for idx, batch in enumerate(tqdm(loader, position = 0)) :
+            if idx == 0 : continue
+            if beam :
+                beam = model.beam_generate(batch, beam_size, k)
+                beam.sort()
+                gen = beam.finished_nodes[0].words
+                out = torch.nn.functional.one_hot(torch.Tensor(gen).long(), num_classes = args.output_vocab_size).unsqueeze(0)
+                out = out[1:, :].unsqueeze(0) #(1, seq_len, num_classes)
+            else :
+                out = model(batch)
+                out = out [:, 1: , :]
+                gen = out[0].argmax(dim = 1)
+                
+            target = batch.target[:, 1:]
+            sen = "GEN\n" + create_sentence(dataset, gen) + "\n"
+            tgt = "GOLD\n" + create_sentence(dataset, target[0]) + "\n"
+            preds.append(sen)
+            targets.append(tgt)
+          
+            if idx % 100 == 1 :
+                print(sen)
+                print(tgt)
+                
+            if test_mode :
+                print(sen)
+                print(tgt)
+                if idx == 10 : break
 
-        beam = model.beam_generate(batch, beam_size=4, k=6)
-        beam.sort()  # sort finished_nodes sequences by their scores
-        beam = dataset.create_sentence(beam.finished_nodes[0].words, batch.rawent)
-        gold = dataset.create_sentence(batch.tgt[0][1:], batch.rawent)
-        preds.append(beam.lower())
-        golds.append(gold.lower())
-        result.write(str(idx+1) + '.\n')
-        result.write("GOLD\n" + gold.encode('ascii', 'ignore').decode('utf-8', 'ignore') + '\n')
-        result.write("GEN\n" + beam.encode('ascii', 'ignore').decode('utf-8', 'ignore').lower() + '\n\n')
+        result = {"GOLD" : targets, "GEN" : preds}
+        if path == None : path = "./outputs/test_result_" + "beam_size-" + str(beam_size) + "_k-" + str(k) + ".tsv" if beam else "./outputs/test_result.tsv"
+        pd.DataFrame(result, columns = ["GOLD", "GEN"]).to_csv(path, sep = "\t", mode = "w")
 
-    return preds, golds
-
-
-if __name__ == "__main__":
-    args = parse_args()
-    args.eval = True
-    dataset = PaperDataset(args)
-    args = set_args(args, dataset)
-    model = Model(args)
-    state_dict = torch.load(args.save, map_location=lambda storage, location: storage)
-    model.load_state_dict(state_dict)
-    model = model.to(args.device)
-    model.args = args
-    model.maxlen = args.maxlen
-    model.starttok = dataset.OUTPUT.vocab.stoi['<start>']
-    model.endtok = dataset.OUTPUT.vocab.stoi['<eos>']
-    model.eostok = dataset.OUTPUT.vocab.stoi['.']
-
-    test(args, dataset, model)
-    # evaluate(model, dataset, args)  # uncomment this and comment above in order to check loss and PPL
-
+    return preds, targets
